@@ -1,13 +1,19 @@
 {
   "name": "my-backend",
-  "version": "1.0.0",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Thin personal AI gateway with explicit context assembly and a single tool registry.",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "check": "node --check server.js && node --check src/config.js && node --check src/context.js && node --check src/provider.js && node --check src/tools.js && node --check src/chat.js"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "cors": "^2.8.5"
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
   }
 }

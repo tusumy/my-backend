@@ -1,48 +1,75 @@
 const express = require('express');
 const cors = require('cors');
+const { getConfig } = require('./src/config');
+const { assembleContext } = require('./src/context');
+const { listBackendTools } = require('./src/tools');
+const { runChat } = require('./src/chat');
+
+const config = getConfig();
 const app = express();
 
-app.use(cors());
-app.use(express.json());
+app.disable('x-powered-by');
+app.use(cors({
+  origin: config.corsOrigins.includes('*') ? true : config.corsOrigins,
+  credentials: false,
+}));
+app.use(express.json({ limit: '2mb' }));
 
-async function callAI(messages, apiKey, baseURL, model) {
-  const response = await fetch(`${baseURL}/v1/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`
-    },
-    body: JSON.stringify({
-      model: model,
-      messages: messages,
-      max_tokens: 1024,
-    })
+app.get('/', (_req, res) => {
+  res.json({
+    name: 'my-backend',
+    status: 'ok',
+    architecture: 'thin-gateway',
+    endpoints: ['/health', '/api/status', '/api/tools', '/api/context/preview', '/api/chat'],
   });
+});
 
-  const data = await response.json();
-  return data.choices[0].message.content;
-}
+app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-app.post('/api/chat', async (req, res) => {
+app.get('/api/status', (_req, res) => {
+  res.json({
+    status: 'ok',
+    provider: {
+      baseUrl: config.ai.baseUrl,
+      model: config.ai.model,
+      configured: Boolean(config.ai.apiKey),
+    },
+    tianzhi: { apiUrl: config.tianzhiApiUrl },
+    tools: listBackendTools(),
+  });
+});
+
+app.get('/api/tools', (_req, res) => {
+  res.json({ backendTools: listBackendTools() });
+});
+
+app.post('/api/context/preview', (req, res, next) => {
   try {
-    const { messages } = req.body;
-    const apiKey = process.env.AI_API_KEY;
-    const baseURL = process.env.AI_BASE_URL || 'https://api.deepseek.com';
-    const model = process.env.AI_MODEL || 'deepseek-chat';
-
-    if (!apiKey) {
-      return res.status(400).json({ error: '请设置 AI_API_KEY 环境变量' });
-    }
-
-    const reply = await callAI(messages, apiKey, baseURL, model);
-    res.json({ reply });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'AI接口调用失败' });
+    const assembled = assembleContext(req.body?.messages || [], req.body?.context || {}, config.systemPrompt);
+    res.json(assembled);
+  } catch (error) {
+    next(error);
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`服务已启动，端口 ${PORT}`);
+app.post('/api/chat', async (req, res, next) => {
+  try {
+    if (!Array.isArray(req.body?.messages)) {
+      return res.status(400).json({ error: 'messages 必须是数组' });
+    }
+    const result = await runChat(config, req.body);
+    return res.json(result);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.use((error, _req, res, _next) => {
+  console.error(error);
+  const status = Number.isInteger(error?.status) ? error.status : 500;
+  res.status(status).json({ error: error?.message || '后端请求失败' });
+});
+
+app.listen(config.port, '0.0.0.0', () => {
+  console.log(`my-backend listening on ${config.port}`);
 });

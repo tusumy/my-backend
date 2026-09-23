@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from importlib.metadata import version
@@ -8,23 +10,36 @@ from typing import Any, Literal
 from fastapi import FastAPI, HTTPException
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
+from mcp.server import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field
 
 from tianzhi_core.bazi import chart, geju, score, strength, tiaohou, yongshen
 
 
+mcp = MCPServer("Tianzhi Core")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    async with mcp.session_manager.run():
+        yield
+
+
 app = FastAPI(
     title="Tianzhi Core API",
-    version="0.1.0",
-    description="Thin HTTP wrapper around tianzhi-core. It returns deterministic structured calculations; interpretation belongs to the caller.",
+    version="0.2.0",
+    description="HTTP + MCP wrapper around tianzhi-core. Deterministic calculation first; interpretation belongs to the caller.",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["Mcp-Session-Id"],
 )
 
 
@@ -93,6 +108,105 @@ def _analysis(c: chart.Chart, req: ChartRequest) -> dict[str, Any]:
     }
 
 
+def _chart_req(
+    birth: str,
+    longitude: float,
+    gender: int,
+    use_true_solar: bool,
+    late_zi: str,
+) -> ChartRequest:
+    return ChartRequest.model_validate(
+        {
+            "birth": birth,
+            "longitude": longitude,
+            "gender": gender,
+            "use_true_solar": use_true_solar,
+            "late_zi": late_zi,
+        }
+    )
+
+
+@mcp.tool()
+def bazi_chart(
+    birth: str,
+    longitude: float = 0.0,
+    gender: int = 0,
+    use_true_solar: bool = True,
+    late_zi: str = "next_day",
+) -> dict[str, Any]:
+    """Build a deterministic BaZi chart from a birth timestamp and optional longitude."""
+    req = _chart_req(birth, longitude, gender, use_true_solar, late_zi)
+    c = _build(req)
+    return {"engine_version": version("tianzhi-core"), "chart": c.to_dict()}
+
+
+@mcp.tool()
+def bazi_analysis(
+    birth: str,
+    longitude: float = 0.0,
+    gender: int = 0,
+    use_true_solar: bool = True,
+    late_zi: str = "next_day",
+) -> dict[str, Any]:
+    """Return chart, strength, five-element power, ten-god power, pattern, tiaohou and yongshen."""
+    req = _chart_req(birth, longitude, gender, use_true_solar, late_zi)
+    c = _build(req)
+    return {"engine_version": version("tianzhi-core"), **_analysis(c, req)}
+
+
+@mcp.tool()
+def bazi_year(
+    birth: str,
+    year_ganzhi: str,
+    longitude: float = 0.0,
+    gender: int = 0,
+    use_true_solar: bool = True,
+    late_zi: str = "next_day",
+    dayun_ganzhi: str | None = None,
+) -> dict[str, Any]:
+    """Score one flow year against a birth chart, optionally including the current da-yun ganzhi."""
+    req = YearRequest.model_validate(
+        {
+            "birth": birth,
+            "longitude": longitude,
+            "gender": gender,
+            "use_true_solar": use_true_solar,
+            "late_zi": late_zi,
+            "year_ganzhi": year_ganzhi,
+            "dayun_ganzhi": dayun_ganzhi,
+        }
+    )
+    c = _build(req)
+    ys = _select_yongshen(c, req)
+    result = score.score_year(
+        c.quad,
+        req.year_ganzhi,
+        dayun_gz=req.dayun_ganzhi,
+        favorable=ys.favorable,
+        unfavorable=ys.unfavorable,
+    )
+    return {
+        "engine_version": version("tianzhi-core"),
+        "bazi": c.bazi,
+        "yongshen": {
+            **_plain(ys),
+            "favorable": list(ys.favorable),
+            "unfavorable": list(ys.unfavorable),
+        },
+        "year": _plain(result),
+    }
+
+
+security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+mcp_app = mcp.streamable_http_app(
+    stateless_http=True,
+    json_response=True,
+    streamable_http_path="/",
+    transport_security=security,
+)
+app.mount("/mcp", mcp_app)
+
+
 @app.get("/")
 def root() -> dict[str, Any]:
     return {
@@ -101,6 +215,7 @@ def root() -> dict[str, Any]:
         "engine": "tianzhi-core",
         "engine_version": version("tianzhi-core"),
         "docs": "/docs",
+        "mcp": "/mcp",
     }
 
 
@@ -110,7 +225,7 @@ def health() -> dict[str, str]:
 
 
 @app.post("/v1/bazi/chart")
-def bazi_chart(req: ChartRequest) -> dict[str, Any]:
+def http_bazi_chart(req: ChartRequest) -> dict[str, Any]:
     try:
         c = _build(req)
         return {"engine_version": version("tianzhi-core"), "chart": c.to_dict()}
@@ -119,7 +234,7 @@ def bazi_chart(req: ChartRequest) -> dict[str, Any]:
 
 
 @app.post("/v1/bazi/analysis")
-def bazi_analysis(req: ChartRequest) -> dict[str, Any]:
+def http_bazi_analysis(req: ChartRequest) -> dict[str, Any]:
     try:
         c = _build(req)
         return {"engine_version": version("tianzhi-core"), **_analysis(c, req)}
@@ -128,7 +243,7 @@ def bazi_analysis(req: ChartRequest) -> dict[str, Any]:
 
 
 @app.post("/v1/bazi/year")
-def bazi_year(req: YearRequest) -> dict[str, Any]:
+def http_bazi_year(req: YearRequest) -> dict[str, Any]:
     try:
         c = _build(req)
         ys = _select_yongshen(c, req)
